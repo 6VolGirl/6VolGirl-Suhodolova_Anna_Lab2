@@ -1,0 +1,53 @@
+# 1. ОКРУЖЕНИЯ И КЭШ PYTHON
+.venv/
+env/
+venv/
+__pycache__/
+*.py[cod]
+
+# 2. JUPYTER
+.ipynb_checkpoints/
+
+# 3. ДАННЫЕ, МОДЕЛИ И РЕЗУЛЬТАТЫ (Не храним в Git!)
+# Папки
+data/
+models/
+outputs/
+reports/
+
+# Тяжелые форматы данных и моделей
+*.csv
+*.parquet
+*.xlsx
+*.xls
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.sqlite
+*.db
+
+# 4. СЕКРЕТЫ И КЛЮЧИ
+.env
+.env.local
+.kaggle/
+kaggle.json
+
+# 5. PYCHARM И WINDOWS
+# PyCharm / IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+.run/
+
+# Windows OS
+Thumbs.db
+Desktop.ini
+*.lnk
+
+# 6. ЛОГИ И КЭШ ИНСТРУМЕНТОВ
+*.log
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
