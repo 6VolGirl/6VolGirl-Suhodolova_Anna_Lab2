@@ -25,10 +25,60 @@ def key_of(text):
 
 
 class NumericCleaner(BaseEstimator, TransformerMixin):
-    """Приводит числовые столбцы к float64 и заменяет невозможные значения на NaN."""
-    def __init__(self, num_cols, bounds=None, pairs=None):
-        (self.num_cols, self.bounds, self.pairs) = num_cols, bounds, pairs
+    """Исправляет единицы расстояния и заменяет недопустимые числа на NaN."""
 
+    def __init__(
+        self, num_cols, bounds=None, pairs=None,
+        distance_threshold=50,  # порог после которого км -> метры
+    ):
+        self.num_cols = num_cols
+        self.bounds = bounds
+        self.pairs = pairs
+        self.distance_threshold = distance_threshold
+
+    def fit(self, X, y=None):
+        # Правила заданы вручную: статистики по данным не вычисляем
+        self.feature_names_in_ = np.array(X.columns, dtype=object)
+        return self
+
+    def transform(self, X):
+        X = X.copy()  # исходную таблицу не изменяем
+
+        # 1. Приводим числа к единому типу
+        for c in self.num_cols:
+            X[c] = pd.to_numeric(X[c], errors="coerce").astype("float64")
+
+        # 2. Предполагаемые метры переводим в километры
+        if "distance_to_center_km" in self.num_cols:
+            mask = X["distance_to_center_km"] > self.distance_threshold
+            X.loc[mask, "distance_to_center_km"] /= 1000
+
+        # 3. Нулевая этажность означает неизвестное значение
+        if "floors_total" in self.num_cols:
+            X.loc[X["floors_total"] == 0, "floors_total"] = np.nan
+
+        # 4. Значения вне допустимых границ заменяем на пропуски
+        for c, (lo, hi) in (self.bounds or {}).items():
+            bad = pd.Series(False, index=X.index)
+            if lo is not None:
+                bad |= X[c] < lo
+            if hi is not None:
+                bad |= X[c] > hi
+            X.loc[bad, c] = np.nan
+
+        # 5. Проверяем отношения между признаками
+        for small, big in (self.pairs or []):
+            bad = X[small] > X[big]
+            X.loc[bad, small] = np.nan
+
+            # каждая площадь допустима, но сумма больше общей
+        bad_sum = (X["living_area"] + X["kitchen_area"] > X["total_area"])
+        X.loc[bad_sum, ["living_area", "kitchen_area"]] = np.nan
+
+        return X
+
+    def get_feature_names_out(self, input_features=None):
+        return self.feature_names_in_
 
 
 class CategoryCleaner(BaseEstimator, TransformerMixin):
