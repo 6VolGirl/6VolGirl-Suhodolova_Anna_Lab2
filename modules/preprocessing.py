@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.utils.validation import check_is_fitted
 from difflib import SequenceMatcher
 
 JUNK_TOKENS = {"", ".", "-", "?", "nan", "none", "n/a"}
@@ -81,6 +82,7 @@ class NumericCleaner(BaseEstimator, TransformerMixin):
         return self.feature_names_in_
 
 
+
 class CategoryCleaner(BaseEstimator, TransformerMixin):
     """Сводит разные написания одной категории к одному и заменяет мусор на NaN.
 
@@ -137,3 +139,82 @@ class CategoryCleaner(BaseEstimator, TransformerMixin):
 
     def get_feature_names_out(self, input_features=None):
         return self.feature_names_in_
+
+
+
+class KitchenMissingFlag(TransformerMixin, BaseEstimator):
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        X["kitchen_area_original_missing"] = X["kitchen_area"].isna().astype(int)
+        return X
+
+
+class AreaShareImputer(TransformerMixin, BaseEstimator):
+    def fit(self, X, y=None):
+        total = X["total_area"].astype(float)
+        living = X["living_area"].astype(float)
+        kitchen = X["kitchen_area"].astype(float)
+        original = X["kitchen_area_original_missing"].eq(1)
+
+        # Не учим доли на известных противоречиях
+        conflict = living.notna() & kitchen.notna() & (living + kitchen > total)
+        valid = total.gt(0) & ~conflict
+
+        living_ok = valid & living.gt(0) & living.lt(total)
+        kitchen_ok = valid & ~original & kitchen.gt(0) & kitchen.lt(total)
+
+        self.living_share_ = (living[living_ok] / total[living_ok]).median()
+        self.kitchen_share_ = (kitchen[kitchen_ok] / total[kitchen_ok]).median()
+
+        if pd.isna(self.living_share_) or pd.isna(self.kitchen_share_):
+            raise ValueError("Недостаточно корректных площадей train для расчёта долей.")
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self, ["living_share_", "kitchen_share_"])
+        X = X.copy()
+        cols = ["total_area", "living_area", "kitchen_area"]
+        X[cols] = X[cols].astype(float)
+
+        original = X["kitchen_area_original_missing"].eq(1)
+        living_missing = X["living_area"].isna()
+        kitchen_missing = X["kitchen_area"].isna() & ~original
+
+        # Флаги сохраняем до заполнения
+        X["living_area_missing"] = living_missing.astype(int)
+        X["kitchen_area_cleaning_missing"] = kitchen_missing.astype(int)
+
+        # Технический ноль — только для исходного пропуска кухни
+        X.loc[original, "kitchen_area"] = 0
+
+        total = X["total_area"]
+        total_ok = total.gt(0) & np.isfinite(total)
+        fill_living = living_missing & total_ok
+        fill_kitchen = kitchen_missing & total_ok
+
+        X.loc[fill_living, "living_area"] = total[fill_living] * self.living_share_
+        X.loc[fill_kitchen, "kitchen_area"] = total[fill_kitchen] * self.kitchen_share_
+
+        # Ограничиваем только оценки, сохраняя известные площади
+        estimated_living = X["living_area"].where(fill_living, 0)
+        estimated_kitchen = X["kitchen_area"].where(fill_kitchen, 0)
+        estimated_sum = estimated_living + estimated_kitchen
+
+        known_living = X["living_area"].where(~fill_living, 0).fillna(0)
+        known_kitchen = X["kitchen_area"].where(~fill_kitchen, 0).fillna(0)
+        available = (total - known_living - known_kitchen).clip(lower=0)
+
+        # 0.95 — выбранный запас, а не норматив площади
+        scale = (0.95 * available / estimated_sum.where(estimated_sum > 0)).clip(upper=1)
+        scale = scale.fillna(1)
+
+        X.loc[fill_living, "living_area"] *= scale[fill_living]
+        X.loc[fill_kitchen, "kitchen_area"] *= scale[fill_kitchen]
+
+        # Если положительного остатка нет, не выдумываем площадь
+        X.loc[fill_living & available.le(0), "living_area"] = np.nan
+        X.loc[fill_kitchen & available.le(0), "kitchen_area"] = np.nan
+        return X
