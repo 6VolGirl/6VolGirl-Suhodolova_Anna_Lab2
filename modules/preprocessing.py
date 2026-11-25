@@ -142,79 +142,112 @@ class CategoryCleaner(BaseEstimator, TransformerMixin):
 
 
 
-class KitchenMissingFlag(TransformerMixin, BaseEstimator):
+class KitchenZeroFiller(TransformerMixin, BaseEstimator):
+    """Заполняет пропуски площади кухни нулём только для студий (rooms == 0) и ставит флаг."""
+
     def fit(self, X, y=None):
+        self.feature_names_in_ = np.array(X.columns, dtype=object)
         return self
 
     def transform(self, X):
         X = X.copy()
-        X["kitchen_area_original_missing"] = X["kitchen_area"].isna().astype(int)
+        mask = X["kitchen_area"].isna() & (X["rooms"] == 0)
+        X["kitchen_area_original_missing"] = mask.astype(int)
+        X.loc[mask, "kitchen_area"] = 0
         return X
 
 
+import numpy as np
+from sklearn.base import BaseEstimator, TransformerMixin
+
+
 class AreaShareImputer(TransformerMixin, BaseEstimator):
+    """Заполняет площади медианными долями от общей площади, рассчитанными на train."""
+
     def fit(self, X, y=None):
         total = X["total_area"].astype(float)
         living = X["living_area"].astype(float)
         kitchen = X["kitchen_area"].astype(float)
-        original = X["kitchen_area_original_missing"].eq(1)
 
-        # Не учим доли на известных противоречиях
+        # Исключаем известные противоречия между площадями
         conflict = living.notna() & kitchen.notna() & (living + kitchen > total)
         valid = total.gt(0) & ~conflict
 
+        # Технические нули кухни не участвуют в расчёте её доли
         living_ok = valid & living.gt(0) & living.lt(total)
-        kitchen_ok = valid & ~original & kitchen.gt(0) & kitchen.lt(total)
+        kitchen_ok = valid & kitchen.gt(0) & kitchen.lt(total)
 
         self.living_share_ = (living[living_ok] / total[living_ok]).median()
         self.kitchen_share_ = (kitchen[kitchen_ok] / total[kitchen_ok]).median()
-
-        if pd.isna(self.living_share_) or pd.isna(self.kitchen_share_):
-            raise ValueError("Недостаточно корректных площадей train для расчёта долей.")
         return self
 
     def transform(self, X):
-        check_is_fitted(self, ["living_share_", "kitchen_share_"])
         X = X.copy()
         cols = ["total_area", "living_area", "kitchen_area"]
         X[cols] = X[cols].astype(float)
 
-        original = X["kitchen_area_original_missing"].eq(1)
+        # Сохраняем происхождение значений до заполнения
         living_missing = X["living_area"].isna()
-        kitchen_missing = X["kitchen_area"].isna() & ~original
-
-        # Флаги сохраняем до заполнения
+        kitchen_missing = X["kitchen_area"].isna()
         X["living_area_missing"] = living_missing.astype(int)
-        X["kitchen_area_cleaning_missing"] = kitchen_missing.astype(int)
-
-        # Технический ноль — только для исходного пропуска кухни
-        X.loc[original, "kitchen_area"] = 0
+        X["kitchen_area_missing"] = kitchen_missing.astype(int)
 
         total = X["total_area"]
-        total_ok = total.gt(0) & np.isfinite(total)
-        fill_living = living_missing & total_ok
-        fill_kitchen = kitchen_missing & total_ok
+        fill_living = living_missing & total.gt(0)
+        fill_kitchen = kitchen_missing & total.gt(0)
 
         X.loc[fill_living, "living_area"] = total[fill_living] * self.living_share_
         X.loc[fill_kitchen, "kitchen_area"] = total[fill_kitchen] * self.kitchen_share_
 
-        # Ограничиваем только оценки, сохраняя известные площади
-        estimated_living = X["living_area"].where(fill_living, 0)
-        estimated_kitchen = X["kitchen_area"].where(fill_kitchen, 0)
-        estimated_sum = estimated_living + estimated_kitchen
-
+        # Отделяем известные площади от подставленных оценок
         known_living = X["living_area"].where(~fill_living, 0).fillna(0)
         known_kitchen = X["kitchen_area"].where(~fill_kitchen, 0).fillna(0)
         available = (total - known_living - known_kitchen).clip(lower=0)
 
-        # 0.95 — выбранный запас, а не норматив площади
-        scale = (0.95 * available / estimated_sum.where(estimated_sum > 0)).clip(upper=1)
-        scale = scale.fillna(1)
+        estimated = X["living_area"].where(fill_living, 0) + X["kitchen_area"].where(fill_kitchen, 0)
+        scale = (available / estimated.where(estimated.gt(0))).clip(upper=1).fillna(1)
 
+        # При необходимости уменьшаем только расчётные значения
         X.loc[fill_living, "living_area"] *= scale[fill_living]
         X.loc[fill_kitchen, "kitchen_area"] *= scale[fill_kitchen]
 
-        # Если положительного остатка нет, не выдумываем площадь
+        # Если свободного остатка нет, площадь не выдумываем
         X.loc[fill_living & available.le(0), "living_area"] = np.nan
         X.loc[fill_kitchen & available.le(0), "kitchen_area"] = np.nan
+        return X
+
+
+class TenantsFromAreaFiller(TransformerMixin, BaseEstimator):
+    """Подбирает число жильцов по ближайшей средней площади с учётом комнат."""
+
+    def fit(self, X, y=None):
+        data = X[["rooms", "total_area", "max_tenants"]].astype(float)
+        known = data.loc[data["max_tenants"].gt(0) & data["total_area"].gt(0)]
+
+        # Общие средние — резерв для неизвестного количества комнат
+        self.area_means_ = known.groupby("max_tenants")["total_area"].median()
+        self.room_means_ = known.groupby(["rooms", "max_tenants"])["total_area"].median()
+        self.fallback_ = data["max_tenants"].dropna().mode().iloc[0]
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        X["max_tenants"] = X["max_tenants"].astype(float)
+        missing = X["max_tenants"].isna()
+        X["max_tenants_missing"] = missing.astype(int)
+
+        # Меняем только неизвестное число жильцов
+        for idx in X.index[missing]:
+            area = X.at[idx, "total_area"]
+            rooms = X.at[idx, "rooms"]
+            means = self.area_means_
+
+            if pd.notna(rooms) and rooms in self.room_means_.index.get_level_values("rooms"):
+                means = self.room_means_.xs(rooms, level="rooms")
+
+            if pd.notna(area) and not means.empty:
+                X.at[idx, "max_tenants"] = (means - area).abs().idxmin()
+            else:
+                X.at[idx, "max_tenants"] = self.fallback_
+
         return X
