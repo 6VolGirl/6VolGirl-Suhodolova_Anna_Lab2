@@ -251,3 +251,50 @@ class TenantsFromAreaFiller(TransformerMixin, BaseEstimator):
                 X.at[idx, "max_tenants"] = self.fallback_
 
         return X
+
+
+
+
+class GroupMedianFiller(TransformerMixin, BaseEstimator):
+    """Заполняет числа медианой типа дома; если группы нет — общей медианой train."""
+
+    def __init__(self, cols, group_col="house_type"):
+        self.cols = cols
+        self.group_col = group_col
+
+    def fit(self, X, y=None):
+        group = X[self.group_col].astype(object)
+        self.medians_ = {c: X[c].astype(float).groupby(group).median() for c in self.cols}
+        self.global_ = {c: X[c].astype(float).median() for c in self.cols}
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        group = X[self.group_col].astype(object)
+        for c in self.cols:
+            # Индикатор создаём до заполнения
+            X[c + "_missing"] = X[c].isna().astype(int)
+            guess = group.map(self.medians_[c]).astype(float).fillna(self.global_[c])
+            X[c] = X[c].astype(float).fillna(guess)
+        return X
+
+
+class FloorsFiller(TransformerMixin, BaseEstimator):
+    """Этажность не меньше этажа, этаж не больше этажности."""
+
+    def fit(self, X, y=None):
+        group = X["house_type"].astype(object)
+        self.total_medians_ = X["floors_total"].astype(float).groupby(group).median()
+        self.total_global_ = X["floors_total"].astype(float).median()
+        self.floor_median_ = X["floor"].astype(float).median()
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        total, floor = X["floors_total"].astype(float), X["floor"].astype(float)
+        X["floors_total_missing"] = total.isna().astype(int)
+        floor = floor.fillna(self.floor_median_)
+        guess = X["house_type"].astype(object).map(self.total_medians_).astype(float).fillna(self.total_global_)
+        X["floors_total"] = total.fillna(np.maximum(guess, floor))
+        X["floor"] = np.minimum(floor, X["floors_total"])
+        return X
