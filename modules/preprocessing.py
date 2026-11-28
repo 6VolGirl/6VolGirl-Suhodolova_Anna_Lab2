@@ -30,29 +30,42 @@ def key_of(text):
     return canon_key(pd.Series([text]))[0]
 
 
+def to_num(s):
+    """Переводит текст в число: убирает пробелы, меняет запятую на точку."""
+    # Если данные уже числовые — возвращаем как есть
+    if pd.api.types.is_numeric_dtype(s):
+        return s
+
+    # Если это Series — обрабатываем как текст
+    if isinstance(s, pd.Series):
+        clean = s.astype(str).str.replace(r"[\s]", "", regex=True).str.replace(",", ".", regex=False)
+        return pd.to_numeric(clean, errors="coerce")
+
+    # Скалярное значение
+    return pd.to_numeric(str(s).replace(" ", "").replace(",", "."), errors="coerce")
+
+
+
 class NumericCleaner(BaseEstimator, TransformerMixin):
     """Исправляет единицы расстояния и заменяет недопустимые числа на NaN."""
 
     def __init__(
         self, num_cols, bounds=None, pairs=None,
         distance_threshold=50,  # порог после которого км -> метры
+        add_flags=False,
     ):
         self.num_cols = num_cols
         self.bounds = bounds
         self.pairs = pairs
         self.distance_threshold = distance_threshold
+        self.add_flags = add_flags
 
-    def fit(self, X, y=None):
-        # Правила заданы вручную: статистики по данным не вычисляем
-        self.feature_names_in_ = np.array(X.columns, dtype=object)
-        return self
-
-    def transform(self, X):
+    def _clean(self, X):
         X = X.copy()  # исходную таблицу не изменяем
 
         # 1. Приводим числа к единому типу
         for c in self.num_cols:
-            X[c] = pd.to_numeric(X[c], errors="coerce").astype("float64")
+            X[c] = to_num(X[c]).astype("float64")
 
         # 2. Предполагаемые метры переводим в километры
         if "distance_to_center_km" in self.num_cols:
@@ -77,14 +90,31 @@ class NumericCleaner(BaseEstimator, TransformerMixin):
             bad = X[small] > X[big]
             X.loc[bad, small] = np.nan
 
-            # каждая площадь допустима, но сумма больше общей
+        # каждая площадь допустима, но сумма больше общей
         bad_sum = (X["living_area"] + X["kitchen_area"] > X["total_area"])
         X.loc[bad_sum, ["living_area", "kitchen_area"]] = np.nan
-
         return X
 
-    def get_feature_names_out(self, input_features=None):
-        return self.feature_names_in_
+    def _flags(self, X, cleaned):
+        raw = X[self.num_cols].apply(pd.to_numeric, errors="coerce")
+        flags = pd.DataFrame({c + "_invalid": (raw[c].notna() & cleaned[c].isna()).astype(int) for c in self.num_cols}, index=X.index)
+        if "distance_to_center_km" in self.num_cols:
+            flags["distance_to_center_km_fixed"] = (raw["distance_to_center_km"] > self.distance_threshold).astype(int)
+        return flags
+
+    def fit(self, X, y=None):
+        # Правила заданы вручную: статистики по данным не вычисляем
+        self.feature_names_in_ = np.array(X.columns, dtype=object)
+        if self.add_flags:
+            flags = self._flags(X, self._clean(X))
+            self.flag_cols_ = flags.columns[flags.any()].tolist()   # флаги только там, где очистка сработала на train
+        return self
+
+    def transform(self, X):
+        cleaned = self._clean(X)
+        if self.add_flags:
+            cleaned = pd.concat([cleaned, self._flags(X, cleaned)[self.flag_cols_]], axis=1)
+        return cleaned
 
 
 
@@ -287,6 +317,7 @@ class FloorsFiller(TransformerMixin, BaseEstimator):
         X = X.copy()
         total, floor = X["floors_total"].astype(float), X["floor"].astype(float)
         X["floors_total_missing"] = total.isna().astype(int)
+        X["floor_missing"] = floor.isna().astype(int)
 
         # 1. Этажность: медиана по десятилетию (если год неизвестен, общая), не меньше известного этажа
         guess = self._decade(X).map(self.total_by_decade_).fillna(self.total_global_).round()
@@ -376,4 +407,31 @@ class UnknownCategoryFiller(TransformerMixin, BaseEstimator):
         X = X.copy()
         for c in self.cols:
             X[c] = X[c].astype(object).where(X[c].notna(), self.value)
+        return X
+
+
+class LogicFlagger(TransformerMixin, BaseEstimator):
+    """Флаги странных сочетаний значений. Значения не меняются, цена не используется (флаги считаются и на новых данных)."""
+
+    def __init__(self, floors_limit=8, no_lift="нет", low_floors=(1, 2), metro_far_m=3000, center_near_km=3, kitchen_share_max=0.4):
+        self.floors_limit = floors_limit
+        self.no_lift = no_lift
+        self.low_floors = low_floors
+        self.metro_far_m = metro_far_m
+        self.center_near_km = center_near_km
+        self.kitchen_share_max = kitchen_share_max
+
+    def fit(self, X, y=None):
+        self.feature_names_in_ = np.array(X.columns, dtype=object)
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        # Высокий дом без лифта (квартиры на нижних этажах не считаем: лифт могли не указать)
+        X["high_floor_no_lift_flag"] = ((X["elevator"] == self.no_lift) & (X["floors_total"] > self.floors_limit) & ~X["floor"].isin(self.low_floors)).astype(int)
+        # Метро далеко, а центр близко
+        X["metro_far_center_near_flag"] = ((X["metro_distance_m"] > self.metro_far_m) & (X["distance_to_center_km"] < self.center_near_km)).astype(int)
+        # Кухня занимает слишком большую долю площади (только по известным значениям)
+        known_kitchen = X["kitchen_area_missing"] == 0 if "kitchen_area_missing" in X.columns else True
+        X["kitchen_big_share_flag"] = (known_kitchen & (X["kitchen_area"] / X["total_area"] > self.kitchen_share_max)).astype(int)
         return X
