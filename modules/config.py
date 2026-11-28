@@ -1,5 +1,6 @@
 #константы, общие для ноутбука и inference
 
+RANDOM_STATE = 42
 TARGET = "rent_rub"
 ID_COLS = ["listing_id"]
 EXCLUDE = ["response_time_hours"]
@@ -60,3 +61,6 @@ VALID_CATEGORIES = {
     "pets_allowed": ["да", "нет"],
     "seller_type": ["собственник", "агент", "застройщик"],
 }
+
+AREA_COLS = ["rooms", "max_tenants", "total_area", "living_area", "kitchen_area"]    # сильно связанные площади
+POLY_COLS = ["total_area", "distance_to_center_km", "year_built", "rooms"]           # для вариантов с взаимодействиями
